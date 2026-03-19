@@ -4,6 +4,7 @@ import rateLimit from 'express-rate-limit';
 import { validateEnvironment, config } from './config/env';
 import routes from './routes';
 import { logger } from './utils/logger';
+import { providerManager } from './services/providerManager';
 
 
 try {
@@ -17,8 +18,12 @@ const app = express();
 const PORT = config.port;
 
 // CORS configuration
+const allowedOrigins = process.env.CLIENT_URL
+    ? process.env.CLIENT_URL.split(',').map(url => url.trim())
+    : ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173'];
+
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:3001','http://localhost:5173'],
+    origin: allowedOrigins,
     credentials: true
 }));
 
@@ -34,7 +39,7 @@ const limiter = rateLimit({
 app.use(express.json());
 
 
-app.use((req, res, next) => {
+app.use((req: any, res: any, next: any) => {
     logger.info(`${req.method} ${req.path}`);
     next();
 });
@@ -43,12 +48,31 @@ app.use((req, res, next) => {
 app.use('/api', limiter, routes);
 
 
-app.get('/', (req, res) => {
+app.get('/', (req: any, res: any) => {
     res.json({ message: 'DevRate API is running 🚀' });
 });
 
+// Initialize AI providers on startup
+async function initializeServer() {
+    try {
+        await providerManager.initializeProviders();
+        logger.info('AI providers initialized successfully');
+    } catch (error) {
+        logger.error('Failed to initialize AI providers:', error);
+    }
+}
 
 app.listen(PORT, () => {
     logger.info(`Server running on http://localhost:${PORT}`);
+    initializeServer();
 
+    // Embed queue worker in API process for free-tier deployment
+    if (process.env.REDIS_URL) {
+        import('./services/queueService').then(({ analysisQueue }) => {
+            import('./workers/aiWorker').then(({ processAnalysisJob }) => {
+                analysisQueue.process(2, async (job: any) => processAnalysisJob(job));
+                logger.info('📨 Queue worker started in API process');
+            });
+        });
+    }
 });

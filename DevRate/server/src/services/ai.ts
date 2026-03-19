@@ -2,10 +2,14 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { AIResult } from '../types';
 import dotenv from 'dotenv';
 import { logger } from '../utils/logger';
+import { providerManager } from './providerManager';
 
 dotenv.config();
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+// Fallback client using env var (backward compatibility)
+const fallbackGenAI = process.env.GEMINI_API_KEY 
+    ? new GoogleGenerativeAI(process.env.GEMINI_API_KEY) 
+    : null;
 
 export const analyzeProfile = async (
     username: string, 
@@ -15,8 +19,31 @@ export const analyzeProfile = async (
 ): Promise<AIResult> => {
     logger.info(`Starting AI Analysis`, { username, prCount: prSummaries.length, commitCount: commitLogs.length, hasJD: !!jobDescription });
     
-    if (!process.env.GEMINI_API_KEY) {
-        logger.warn("No GEMINI_API_KEY found. Returning default neutral score.");
+    // Try to get a provider from DB, fallback to env var
+    let genAI: GoogleGenerativeAI | null = null;
+    let providerId: number | null = null;
+
+    try {
+        const provider = await providerManager.getAvailableProvider();
+        if (provider) {
+            const apiKey = await providerManager.getProviderKey(provider.id);
+            if (apiKey) {
+                genAI = new GoogleGenerativeAI(apiKey);
+                providerId = provider.id;
+                logger.info(`Using provider: ${provider.provider_name} (id: ${provider.id})`);
+            }
+        }
+    } catch (err) {
+        logger.warn('Failed to get provider from DB, trying env fallback');
+    }
+
+    // Fallback to env var
+    if (!genAI) {
+        genAI = fallbackGenAI;
+    }
+
+    if (!genAI) {
+        logger.warn("No AI provider available. Returning default neutral score.");
         const fallback: AIResult = { 
             multiplier: 1.0, 
             persona: "The Unknown Dev", 
@@ -110,7 +137,6 @@ export const analyzeProfile = async (
         ${outputFormat}
         `;
 
-        // logger is imported at top
         logger.info("Sending Prompt to AI", { model: "gemini-2.5-flash", username });
         logger.debug("AI Prompt Content", { promptShort: prompt.trim().replace(/\s+/g, ' ').substring(0, 70) });
         
@@ -140,6 +166,11 @@ export const analyzeProfile = async (
         // Clean JSON formatting (Gemini sometimes adds backticks)
         const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
         const json = JSON.parse(cleanText);
+
+        // Record success in provider manager
+        if (providerId) {
+            await providerManager.recordSuccess(providerId);
+        }
         
         return {
             multiplier: json.multiplier || 1.0,
@@ -151,13 +182,18 @@ export const analyzeProfile = async (
         };
 
     } catch (error: any) {
+        // Record failure in provider manager
+        if (providerId) {
+            await providerManager.recordFailure(providerId, error);
+        }
+
         if (error?.message?.includes('API_KEY')) {
             console.warn("⚠️  AI Service Warning: Invalid or Suspended API Key. Using Default Score.");
         } else if (error?.status === 403) {
             console.warn("⚠️  AI Service Warning: Access Denied (403). Using Default Score.");
         } else {
             console.warn("⚠️  AI Service Warning: Failed to generate content. Using Default Score.");
-            console.error("DEBUG ERROR DETAILS:", error); // Uncommented for debugging
+            console.error("DEBUG ERROR DETAILS:", error);
         }
         
         return { 

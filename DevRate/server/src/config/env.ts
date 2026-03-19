@@ -9,6 +9,7 @@ export const config = {
   jwtSecret: process.env.JWT_SECRET!,
   githubToken: process.env.GITHUB_TOKEN!,
   geminiApiKey: process.env.GEMINI_API_KEY!,
+  redisUrl: process.env.REDIS_URL || 'redis://localhost:6379',
   db: {
     host: process.env.DB_HOST!,
     port: parseInt(process.env.DB_PORT || '5432'),
