@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { getRating } from '../controllers/ratingController';
 import { getUserProfiles, deleteProfile } from '../controllers/profileController';
-import { uploadBulkRatings, getBulkSessions, getBulkSessionDetails } from '../controllers/bulkController';
+import { uploadBulkRatings, getBulkSessions, getBulkSessionDetails, getBulkSessionStatus } from '../controllers/bulkController';
 import { authenticateToken } from '../middleware/auth';
 import { upload } from '../middleware/upload';
 import * as authController from '../controllers/authController';
@@ -19,6 +19,7 @@ router.get('/rating/:username', authenticateToken, getRating);
 router.post('/bulk-rate', authenticateToken, upload.single('file'), uploadBulkRatings);
 router.get('/bulk-sessions', authenticateToken, getBulkSessions);
 router.get('/bulk-sessions/:sessionId', authenticateToken, getBulkSessionDetails);
+router.get('/bulk-sessions/:sessionId/status', authenticateToken, getBulkSessionStatus);
 
 // Profile routes
 router.get('/profiles', authenticateToken, getUserProfiles);

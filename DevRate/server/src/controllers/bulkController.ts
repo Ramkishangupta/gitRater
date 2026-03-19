@@ -3,6 +3,7 @@ import { AuthRequest } from '../middleware/auth';
 import { logger } from '../utils/logger';
 import * as xlsx from 'xlsx';
 import { getOrCalculateRating } from '../services/ratingService';
+import { addAnalysisJob, getBulkJobStatus } from '../services/queueService';
 import pool from '../db';
 
 export const uploadBulkRatings = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -14,6 +15,7 @@ export const uploadBulkRatings = async (req: AuthRequest, res: Response): Promis
     try {
         const userId = req.user?.userId;
         const sessionName = req.body.sessionName || `Analysis ${new Date().toLocaleDateString()}`;
+        const jobDescription = req.body.jobDescription;
         
         const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
         const sheetName = workbook.SheetNames[0];
@@ -22,11 +24,6 @@ export const uploadBulkRatings = async (req: AuthRequest, res: Response): Promis
 
         logger.info(`Processing bulk upload file: ${req.file.originalname} with ${data.length} rows.`);
 
-        const results = [];
-        const errors = [];
-        
-        // Find column containing GitHub URL
-        // We'll check the first row for any value that looks like a github url or key name 'github'
         if (data.length === 0) {
             res.json({ success: true, message: 'File is empty.', data: [] });
             return;
@@ -58,90 +55,63 @@ export const uploadBulkRatings = async (req: AuthRequest, res: Response): Promis
 
         logger.info(`Identified GitHub URL column: ${urlKey}`);
 
-        // Process sequentially to be safe with rate limits
+        // Extract all usernames
+        const usernames: string[] = [];
         for (const row of data as any[]) {
             const url = row[urlKey];
             if (!url) continue;
 
-            // Extract username from URL (https://github.com/username)
             const parts = String(url).split('github.com/');
             if (parts.length < 2) continue;
             
             const username = parts[1].split('/')[0].trim();
-            if (!username) continue;
+            if (username) usernames.push(username);
+        }
 
+        if (usernames.length === 0) {
+            res.status(400).json({ success: false, error: 'No valid GitHub usernames found in file.' });
+            return;
+        }
+
+        // Create bulk analysis session
+        const sessionResult = await pool.query(
+            `INSERT INTO bulk_analysis_sessions (user_id, session_name, total_profiles)
+             VALUES ($1, $2, $3) RETURNING id`,
+            [userId, sessionName, usernames.length]
+        );
+        const sessionId = sessionResult.rows[0].id;
+
+        logger.info(`Created bulk analysis session ${sessionId} with ${usernames.length} profiles`);
+
+        // Queue all jobs asynchronously
+        const jobIds: string[] = [];
+        for (const username of usernames) {
             try {
-                logger.info(`Processing bulk user: ${username}`);
-                
-                // Extract job description if present
-                const jobDescription = req.body.jobDescription;
-                
-                const rating = await getOrCalculateRating(username, userId, jobDescription);
-                results.push({
-                    ...row,
-                    devRate_score: rating.data.tier,
-                    devRate_total: rating.data.score_breakdown.quality_score,
-                    job_fit_score: (rating.data.ai_analysis as any)?.job_fit_score,
-                    match_reason: (rating.data.ai_analysis as any)?.match_reason
+                const jobId = await addAnalysisJob({
+                    userId: userId!,
+                    sessionId,
+                    username,
+                    jobDescription,
+                    jobType: 'bulk_analysis'
                 });
+                jobIds.push(jobId);
+                logger.debug(`Queued job ${jobId} for ${username}`);
             } catch (err: any) {
-                logger.error(`Failed to process ${username}`, err);
-                errors.push({ username, error: err.message });
-                results.push({
-                    ...row,
-                    devRate_error: 'Failed to process'
-                });
+                logger.error(`Failed to queue job for ${username}:`, err);
             }
         }
 
-        // Save bulk analysis session to database
-        let sessionId: number | null = null;
-        if (userId && results.length > 0) {
-            try {
-                const sessionResult = await pool.query(
-                    `INSERT INTO bulk_analysis_sessions (user_id, session_name, total_profiles)
-                     VALUES ($1, $2, $3) RETURNING id`,
-                    [userId, sessionName, results.length]
-                );
-                sessionId = sessionResult.rows[0].id;
+        logger.info(`Queued ${jobIds.length} jobs for bulk analysis session ${sessionId}`);
 
-                // Save each profile result
-                for (const result of results) {
-                    const candidateName = result.Name || result['Candidate Name'] || '';
-                    const githubUrl = result['GitHub Link'] || result['GitHub'] || result['github'] || '';
-                    const username = githubUrl ? String(githubUrl).split('github.com/')[1]?.split('/')[0] : '';
-
-                    await pool.query(
-                        `INSERT INTO bulk_analysis_profiles 
-                        (session_id, candidate_name, github_url, github_username, devrate_tier, 
-                         quality_score, job_fit_score, match_reason, error_message, profile_data)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-                        [
-                            sessionId,
-                            candidateName,
-                            githubUrl,
-                            username,
-                            result.devRate_score || null,
-                            result.devRate_total || null,
-                            result.job_fit_score || null,
-                            result.match_reason || null,
-                            result.devRate_error || null,
-                            JSON.stringify(result)
-                        ]
-                    );
-                }
-                logger.info(`Saved bulk analysis session ${sessionId} with ${results.length} profiles`);
-            } catch (dbError) {
-                logger.error('Failed to save bulk analysis to database:', dbError);
-            }
-        }
-
+        // Return immediately with session info
         res.json({
             success: true,
-            message: `Processed ${results.length} profiles.`,
+            message: `Queued ${jobIds.length} profiles for analysis`,
             sessionId,
-            data: results,
-            errors: errors.length > 0 ? errors : undefined
+            totalProfiles: usernames.length,
+            jobIds,
+            pollingUrl: `/api/bulk-sessions/${sessionId}/status`,
+            estimatedCompletion: new Date(Date.now() + usernames.length * 5000).toISOString()
         });
 
     } catch (error) {
@@ -217,5 +187,83 @@ export const getBulkSessionDetails = async (req: AuthRequest, res: Response): Pr
     } catch (error) {
         logger.error('Error fetching bulk session details:', error);
         res.status(500).json({ success: false, error: 'Failed to fetch session details.' });
+    }
+};
+
+// Get real-time status of a bulk analysis session
+export const getBulkSessionStatus = async (req: AuthRequest, res: Response): Promise<void> => {
+    try {
+        const userId = req.user?.userId;
+        const sessionId = req.params.sessionId;
+
+        if (!userId) {
+            res.status(401).json({ success: false, error: 'Unauthorized' });
+            return;
+        }
+
+        // Verify session belongs to user
+        const sessionResult = await pool.query(
+            `SELECT * FROM bulk_analysis_sessions 
+             WHERE id = $1 AND user_id = $2`,
+            [sessionId, userId]
+        );
+
+        if (sessionResult.rows.length === 0) {
+            res.status(404).json({ success: false, error: 'Session not found' });
+            return;
+        }
+
+        const session = sessionResult.rows[0];
+
+        // Get job statuses
+        const jobsResult = await pool.query(
+            `SELECT status, github_username, error_message 
+             FROM analysis_jobs 
+             WHERE session_id = $1`,
+            [sessionId]
+        );
+
+        const total = session.total_profiles;
+        const jobs = jobsResult.rows;
+
+        const completed = jobs.filter((j: any) => j.status === 'completed').length;
+        const processing = jobs.filter((j: any) => j.status === 'processing').length;
+        const pending = jobs.filter((j: any) => j.status === 'pending').length;
+        const failed = jobs.filter((j: any) => j.status === 'failed').length;
+
+        const progress = total > 0 ? (completed / total) * 100 : 0;
+        const isComplete = completed + failed === total;
+
+        // Calculate estimated time remaining (assuming 5 seconds per job)
+        const remaining = total - completed - failed;
+        const estimatedSeconds = remaining * 5;
+        const estimatedTimeRemaining = estimatedSeconds > 0 
+            ? `${Math.ceil(estimatedSeconds / 60)} minutes` 
+            : '0 seconds';
+
+        // Get errors
+        const errors = jobs
+            .filter((j: any) => j.status === 'failed')
+            .map((j: any) => ({
+                username: j.github_username,
+                reason: j.error_message
+            }));
+
+        res.json({
+            success: true,
+            sessionId: parseInt(sessionId as string),
+            total,
+            completed,
+            processing,
+            pending,
+            failed,
+            progress: Math.round(progress * 10) / 10,
+            isComplete,
+            estimatedTimeRemaining,
+            errors: errors.length > 0 ? errors : undefined
+        });
+    } catch (error) {
+        logger.error('Error fetching bulk session status:', error);
+        res.status(500).json({ success: false, error: 'Failed to fetch session status.' });
     }
 };
