@@ -39,7 +39,7 @@ const limiter = rateLimit({
 app.use(express.json());
 
 
-app.use((req, res, next) => {
+app.use((req: any, res: any, next: any) => {
     logger.info(`${req.method} ${req.path}`);
     next();
 });
@@ -48,7 +48,7 @@ app.use((req, res, next) => {
 app.use('/api', limiter, routes);
 
 
-app.get('/', (req, res) => {
+app.get('/', (req: any, res: any) => {
     res.json({ message: 'DevRate API is running 🚀' });
 });
 
